@@ -1,15 +1,22 @@
 package main
 
 import (
+	"cmp"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -17,47 +24,43 @@ import (
 //go:embed frontend
 var staticFiles embed.FS
 
+const THRESHOLD = 5
+const NUM_SCORES = 20
+const MIN_TIME = 15
+
+type Token struct {
+	Start int64  `json:start`
+	Hmac  string `json:hmac`
+}
+
 type Score struct {
-	PlayerName string `json:"player_name"`
-	Score      *int   `json:"score,omitempty"`
-	Progress   int    `json:"progress"`
+	PlayerName      string `json:"player_name"`
+	Elapsed         int    `json:"elapsed,omitempty"`
+	RemainingHealth int    `json:"remaining_health"`
+	Token           Token  `json:"token"`
+}
+
+func scoreCmp(a Score, b Score) int {
+	return cmp.Or(
+		-cmp.Compare(a.Elapsed, b.Elapsed),
+		cmp.Compare(a.RemainingHealth, b.RemainingHealth),
+	)
 }
 
 type HighScoreServer struct {
-	scores map[string]Score
-	mutex  sync.Mutex
+	scores  []Score
+	hmacKey []byte
+	mutex   sync.Mutex
 }
 
-func (s *HighScoreServer) getScores(n int) []Score {
+func (s *HighScoreServer) truncateAndGetScores(n int) []Score {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	sortedScores := make([]Score, 0, len(s.scores))
-	for _, score := range s.scores {
-		sortedScores = append(sortedScores, score)
-	}
+	slices.SortStableFunc(s.scores, scoreCmp)
+	s.scores = s.scores[:n]
 
-	sort.SliceStable(sortedScores, func(i, j int) bool {
-		if sortedScores[i].Score == nil && sortedScores[j].Score == nil {
-			return sortedScores[i].Progress < sortedScores[j].Progress
-		}
-		if sortedScores[i].Score == nil {
-			return false
-		}
-		if sortedScores[j].Score == nil {
-			return true
-		}
-		if *sortedScores[i].Score == *sortedScores[j].Score {
-			return sortedScores[i].Progress < sortedScores[j].Progress
-		}
-		return *sortedScores[i].Score < *sortedScores[j].Score
-	})
-
-	if n > len(sortedScores) {
-		n = len(sortedScores)
-	}
-
-	return sortedScores[:n]
+	return s.scores
 }
 
 func (s *HighScoreServer) addScore(w http.ResponseWriter, r *http.Request) {
@@ -67,28 +70,72 @@ func (s *HighScoreServer) addScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// validate the score
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, uint64(newScore.Token.Start))
+
+	mac := hmac.New(sha256.New, s.hmacKey)
+	mac.Write(b)
+	result := mac.Sum(nil)
+
+	signature, err := base64.StdEncoding.DecodeString(newScore.Token.Hmac)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if !hmac.Equal(signature, result) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if newScore.Elapsed < MIN_TIME {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if newScore.RemainingHealth < 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	t := time.Now().Unix()
+
+	if math.Abs(float64(t-newScore.Token.Start-int64(newScore.Elapsed))) >= THRESHOLD {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	existingScore, exists := s.scores[newScore.PlayerName]
-	if !exists || isNewScoreBetter(existingScore, newScore) {
-		s.scores[newScore.PlayerName] = newScore
-	}
+	// Zero out the token to save space
+	newScore.Token = Token{}
+
+	s.scores = append(s.scores, newScore)
 
 	w.WriteHeader(http.StatusCreated)
 }
 
-func isNewScoreBetter(existing, new Score) bool {
-	if existing.Score == nil && new.Score != nil {
-		return true
-	}
-	if new.Score != nil && existing.Score != nil && *new.Score < *existing.Score {
-		return true
-	}
-	if new.Score == nil && existing.Score == nil && new.Progress < existing.Progress {
-		return true
-	}
-	return false
+func (s *HighScoreServer) getToken(w http.ResponseWriter, r *http.Request) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	t := time.Now().Unix()
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, uint64(t))
+
+	mac := hmac.New(sha256.New, s.hmacKey)
+	mac.Write(b)
+	result := mac.Sum(nil)
+	token := base64.StdEncoding.EncodeToString(result)
+
+	w.WriteHeader(http.StatusCreated)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(Token{
+		Start: t,
+		Hmac:  token,
+	})
 }
 
 func (srv *HighScoreServer) stream(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +160,7 @@ func (srv *HighScoreServer) stream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			scores := srv.getScores(10)
+			scores := srv.truncateAndGetScores(NUM_SCORES)
 			data, err := json.Marshal(scores)
 			if err != nil {
 				log.Println(err)
@@ -134,8 +181,15 @@ func main() {
 	host := flag.String("host", ":0", "host (including port) to listen on")
 	flag.Parse()
 
+	hmacKey := make([]byte, 16)
+	_, err := rand.Read(hmacKey)
+	if err != nil {
+		panic(err)
+	}
+
 	server := &HighScoreServer{
-		scores: make(map[string]Score),
+		scores:  make([]Score, NUM_SCORES),
+		hmacKey: hmacKey,
 	}
 
 	// Set up static server
@@ -150,6 +204,7 @@ func main() {
 	// Set up streaming server
 	http.HandleFunc("/events", server.stream)
 
+	http.HandleFunc("/start", server.getToken)
 	http.HandleFunc("/record", server.addScore)
 
 	listener, err := net.Listen("tcp", *host)
