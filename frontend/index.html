@@ -46,7 +46,7 @@
     let audioCtx;
 
     const startButton = document.getElementById("startButton");
-    startButton.addEventListener("click", function () {
+    startButton.addEventListener("click", async () => {
       // import kaboom lib
       // import kaboom from "https://unpkg.com/kaboom@3000.0.1/dist/kaboom.mjs";
 
@@ -87,10 +87,12 @@
 
       loadShaderURL("crt", null, "/shaders/crt.frag");
 
-      scene("battle", () => {
+      scene("battle", async () => {
+        const token = await (await fetch("/start")).json();
         var interBulletDelay = 250;
         var lastFired = 0;
         var enemiesSpawned = 0;
+        let events = [];
 
         const BULLET_SPEED = 1200;
         const TRASH_SPEED = 120;
@@ -104,6 +106,7 @@
         const playerName = choose(players);
 
         let insaneMode = false;
+        let insaneModeSticky = false;
 
         const music = play("flow");
         music.loop = true;
@@ -203,11 +206,21 @@
         onKeyPress("up", () => {
           insaneMode = true;
           music.speed = 2;
+          events.push({
+            name: "insaneMode on",
+            ts: timer.time,
+          });
         });
 
         onKeyRelease("up", () => {
-          insaneMode = false;
-          music.speed = 1;
+          if (!insaneModeSticky) {
+            insaneMode = false;
+            music.speed = 1;
+            events.push({
+              name: "insaneMode off",
+              ts: timer.time,
+            });
+          }
         });
 
         player.onCollide("enemy", (e) => {
@@ -219,7 +232,11 @@
           addExplode(center(), 12, 120, 30);
           wait(1, () => {
             music.paused = true;
-            go("battle");
+            go("end", {
+              time: timer.time,
+              boss_hp: boss.hp(),
+              token: token,
+            });
           });
         });
 
@@ -231,6 +248,9 @@
 
         player.onCollide("wb", (t) => {
           interBulletDelay /= 2;
+          if (interBulletDelay < 1) {
+            interBulletDelay = 1;
+          }
 
           add([
             text("Workbench! Moar lasers.", { size: 80 }),
@@ -255,6 +275,7 @@
 
         player.onCollide("eventd", (t) => {
           insaneMode = true;
+          insaneModeSticky = true;
           music.speed = 2;
 
           add([
@@ -264,6 +285,10 @@
             lifespan(1),
             fixed(),
           ]);
+          events.push({
+            name: "insaneMode on",
+            ts: timer.time,
+          });
         });
 
         function addExplode(p, n, rad, size) {
@@ -304,8 +329,8 @@
           //}
         });
 
-        onKeyDown("space", () => {
-          var millis = Date.now();
+        const fire = () => {
+          const millis = time() * 1000;
           if (lastFired + interBulletDelay < millis) {
             spawnBullet(player.pos.sub(40, 20));
             spawnBullet(player.pos.add(20, -20));
@@ -315,23 +340,12 @@
             });
             lastFired = millis;
           }
-        });
-
-        const touching = () => {
-          var millis = Date.now();
-          if (lastFired + interBulletDelay < millis) {
-            spawnBullet(player.pos.sub(20, 0));
-            spawnBullet(player.pos.add(20, 0));
-            play("shoot", {
-              volume: 0.3,
-              detune: rand(-1200, 1200),
-            });
-            lastFired = millis;
-          }
         };
+
+        onKeyDown("space", fire);
         onTouchStart((pos, t) => {
           touchDownX = pos.x;
-          touching();
+          fire();
         });
 
         onTouchMove((pos, t) => {
@@ -482,7 +496,11 @@
             addExplode(center(), 12, 120, 30);
             wait(1, () => {
               music.paused = true;
-              go("battle");
+              go("end", {
+                time: timer.time,
+                boss_hp: boss.hp(),
+                token: token,
+              });
             });
           }
         });
@@ -503,9 +521,10 @@
 
         boss.onDeath(() => {
           //music.stop()
-          go("win", {
+          go("end", {
             time: timer.time,
-            boss: bossName,
+            boss_hp: 0,
+            token: token,
           });
         });
 
@@ -539,25 +558,134 @@
         });
       });
 
-      scene("win", ({ time, boss }) => {
-        add([
-          sprite("scene"),
+      scene("end", async ({ time, boss_hp, token }) => {
+        let name = localStorage.name;
+        let sentHighScore = false;
+        if (!name) {
+          name = "UNK";
+          localStorage.name = name;
+        }
+
+        if (boss_hp > 0) {
+          add([
+            text(`You survived for ${time.toFixed(2)} seconds`, 24),
+            anchor("center"),
+            pos(width() / 2, 100),
+          ]);
+        } else {
+          add([
+            sprite("scene"),
+            anchor("center"),
+            scale(1),
+            pos(width() / 2, height() / 2),
+          ]);
+          add([
+            text(`You sqaushed the bug in ${time.toFixed(2)} seconds`, 24),
+            anchor("center"),
+            pos(width() / 2, 100),
+          ]);
+        }
+
+        if (boss_hp > 0) {
+          add([
+            text(`Almost! The bug still has ${boss_hp} health :(`, 48),
+            anchor("center"),
+            pos(width() / 2, 40),
+          ]);
+
+          const bg = add([
+            rect(240, 80),
+            anchor("center"),
+            area(),
+            pos(width() / 2, 200),
+            color(0, 0, 0),
+          ]);
+
+          const txt = add([
+            text("Try again?", 48),
+            anchor("center"),
+            pos(width() / 2, 200),
+          ]);
+
+          bg.onHover(() => {
+            bg.color = rgb(255, 255, 255);
+            txt.color = rgb(0, 0, 0);
+          });
+          bg.onHoverEnd(() => {
+            bg.color = rgb(0, 0, 0);
+            txt.color = rgb(255, 255, 255);
+          });
+          bg.onClick(() => {
+            go("battle");
+          });
+
+          add([
+            rect(340, 80),
+            anchor("center"),
+            area(),
+            pos(width() / 2, height() / 2),
+            color(0, 0, 0),
+          ]);
+        } else {
+          add([
+            text("Thank you for your work on the dev keynote!", 48),
+            anchor("center"),
+            pos(width() / 2, 40),
+          ]);
+        }
+
+        const txt2 = add([
+          text(`Your name: ${name}`, 48),
           anchor("center"),
-          scale(1),
           pos(width() / 2, height() / 2),
         ]);
 
-        add([
-          text(time.toFixed(2), 24),
-          anchor("center"),
-          pos(width() / 2, 100),
-        ]);
+        onCharInput((ch) => {
+          if (ch.match(/[a-z]/i)) {
+            name += ch.toUpperCase();
+            if (name.length > 3) {
+              name = name.substring(name.length - 3);
+            }
+            localStorage.name = name;
+            txt2.text = `Your name: ${name}`;
+          }
+        });
+        onKeyPressRepeat("backspace", () => {
+          if (name.length > 1) {
+            name = name.substring(0, name.length - 1);
+            txt2.text = `Your name: ${name}`;
+          }
+        });
 
         add([
-          text("Thank you for your work on the dev keynote!", 48),
+          text(
+            "Hit the space bar to submit your high score and play again",
+            48,
+          ),
           anchor("center"),
-          pos(width() / 2, 40),
+          pos(width() / 2, height() - 100),
         ]);
+        onKeyPress("space", async () => {
+          if (name.length > 0 && name.length <= 3) {
+            if (!sentHighScore) {
+              sentHighScore = true;
+              await fetch("/record", {
+                method: "POST",
+                headers: {
+                  Accept: "application/json",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  player_name: name,
+                  elapsed: Math.round(time * 100) / 100,
+                  token: token,
+                  remaining_health: boss_hp,
+                }),
+              });
+              go("battle");
+            }
+          }
+        });
       });
 
       k.go("battle");

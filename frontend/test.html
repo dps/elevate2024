@@ -18,87 +18,21 @@
   </head>
   <body>
     <h1>High Score Reporting</h1>
-    <div id="score-form">
-      <h2>Submit a Score</h2>
-      <form id="form">
-        <label for="playerName">Player Name:</label><br />
-        <input
-          type="text"
-          id="playerName"
-          name="playerName"
-          required
-        /><br /><br />
-        <label for="score">Score (Time to Complete):</label><br />
-        <input type="number" id="score" name="score" /><br /><br />
-        <label for="progress">Progress (0 to 100):</label><br />
-        <input
-          type="number"
-          id="progress"
-          name="progress"
-          required
-          min="0"
-          max="100"
-        /><br /><br />
-        <input type="submit" value="Submit" />
-      </form>
-    </div>
     <div id="scores">
       <h2>Top Scores</h2>
-      <ul id="score-list"></ul>
+      <pre id="score-list"></pre>
     </div>
 
     <script>
-      const form = document.getElementById("form");
       const scoreList = document.getElementById("score-list");
-
-      // Function to submit a new score
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-
-        const playerName = document.getElementById("playerName").value;
-        const score = document.getElementById("score").value;
-        const progress = document.getElementById("progress").value;
-
-        const data = {
-          player_name: playerName,
-          progress: parseInt(progress),
-        };
-
-        if (score) {
-          data.score = parseInt(score);
-        }
-
-        try {
-          const response = await fetch("http://localhost:8000/record", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(data),
-          });
-
-          if (response.ok) {
-            form.reset();
-          } else {
-            console.error("Failed to submit score:", response.statusText);
-          }
-        } catch (error) {
-          console.error("Error submitting score:", error);
-        }
-      });
 
       // Function to update the score list
       const updateScoreList = (scores) => {
-        scoreList.innerHTML = "";
-        scores.forEach((score) => {
-          const li = document.createElement("li");
-          li.textContent = `Player: ${score.player_name}, Score: ${score.score || "N/A"}, Progress: ${score.progress}`;
-          scoreList.appendChild(li);
-        });
+        scoreList.innerHTML = JSON.stringify(scores, null, 2);
       };
 
       // Set up Server-Sent Events (SSE) to stream scores
-      const eventSource = new EventSource("http://localhost:8000/events");
+      const eventSource = new EventSource("/events");
 
       eventSource.onmessage = (event) => {
         const scores = JSON.parse(event.data);

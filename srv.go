@@ -26,31 +26,31 @@ var staticFiles embed.FS
 
 const THRESHOLD = 5
 const NUM_SCORES = 20
-const MIN_TIME = 15
 
 type Token struct {
-	Start int64  `json:start`
-	Hmac  string `json:hmac`
+	Start int64  `json:"start"`
+	Hmac  string `json:"hmac"`
 }
 
 type Score struct {
-	PlayerName      string `json:"player_name"`
-	Elapsed         int    `json:"elapsed,omitempty"`
-	RemainingHealth int    `json:"remaining_health"`
-	Token           Token  `json:"token"`
+	PlayerName      string  `json:"player_name"`
+	Elapsed         float64 `json:"elapsed"`
+	RemainingHealth int     `json:"remaining_health"`
+	Token           Token   `json:"token"`
 }
 
 func scoreCmp(a Score, b Score) int {
 	return cmp.Or(
-		-cmp.Compare(a.Elapsed, b.Elapsed),
 		cmp.Compare(a.RemainingHealth, b.RemainingHealth),
+		-cmp.Compare(a.Elapsed, b.Elapsed),
 	)
 }
 
 type HighScoreServer struct {
-	scores  []Score
-	hmacKey []byte
-	mutex   sync.Mutex
+	scores        []Score
+	hmacKey       []byte
+	mutex         sync.Mutex
+	adminPassword string
 }
 
 func (s *HighScoreServer) truncateAndGetScores(n int) []Score {
@@ -58,7 +58,11 @@ func (s *HighScoreServer) truncateAndGetScores(n int) []Score {
 	defer s.mutex.Unlock()
 
 	slices.SortStableFunc(s.scores, scoreCmp)
-	s.scores = s.scores[:n]
+	t := n
+	if len(s.scores) < n {
+		t = len(s.scores)
+	}
+	s.scores = s.scores[:t]
 
 	return s.scores
 }
@@ -89,19 +93,20 @@ func (s *HighScoreServer) addScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if newScore.Elapsed < MIN_TIME {
+	if newScore.RemainingHealth < 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	if newScore.RemainingHealth < 0 {
+	if len(newScore.PlayerName) < 1 || len(newScore.PlayerName) > 3 {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	t := time.Now().Unix()
 
-	if math.Abs(float64(t-newScore.Token.Start-int64(newScore.Elapsed))) >= THRESHOLD {
+	if math.Abs(float64(t-newScore.Token.Start)-newScore.Elapsed) >= THRESHOLD {
+		log.Printf("Received odd elapsed time: %v (token says %v)\n", newScore.Elapsed, t-newScore.Token.Start)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -136,6 +141,27 @@ func (s *HighScoreServer) getToken(w http.ResponseWriter, r *http.Request) {
 		Start: t,
 		Hmac:  token,
 	})
+}
+
+func (s *HighScoreServer) resetScore(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	pw := r.FormValue("pw")
+	if pw == s.adminPassword {
+		s.mutex.Lock()
+		defer s.mutex.Unlock()
+
+		log.Println("Cleared scores")
+		s.scores = []Score{}
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusForbidden)
+	}
+
 }
 
 func (srv *HighScoreServer) stream(w http.ResponseWriter, r *http.Request) {
@@ -177,19 +203,20 @@ func (srv *HighScoreServer) stream(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	host := flag.String("host", ":0", "host (including port) to listen on")
+	adminPassword := flag.String("pw", "changeme", "password needed to reset the high scores")
 	flag.Parse()
 
 	hmacKey := make([]byte, 16)
 	_, err := rand.Read(hmacKey)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	server := &HighScoreServer{
-		scores:  make([]Score, NUM_SCORES),
-		hmacKey: hmacKey,
+		scores:        []Score{},
+		hmacKey:       hmacKey,
+		adminPassword: *adminPassword,
 	}
 
 	// Set up static server
@@ -206,6 +233,7 @@ func main() {
 
 	http.HandleFunc("/start", server.getToken)
 	http.HandleFunc("/record", server.addScore)
+	http.HandleFunc("/reset", server.resetScore)
 
 	listener, err := net.Listen("tcp", *host)
 	if err != nil {
@@ -213,7 +241,8 @@ func main() {
 	}
 
 	url := fmt.Sprintf("http://%v/", listener.Addr().(*net.TCPAddr))
-	fmt.Printf("Serving on %v\n", url)
+	log.Printf("Serving on %v\n", url)
+	log.Printf("Admin password is \"%v\"\n", *adminPassword)
 
 	panic(http.Serve(listener, nil))
 }
