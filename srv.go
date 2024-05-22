@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"slices"
@@ -104,12 +103,16 @@ func (s *HighScoreServer) addScore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t := time.Now().Unix()
-
-	if math.Abs(float64(t-newScore.Token.Start)-newScore.Elapsed) >= THRESHOLD {
-		log.Printf("Received odd elapsed time: %v (token says %v)\n", newScore.Elapsed, t-newScore.Token.Start)
+	wallClockElapsed := float64(t - newScore.Token.Start)
+	// We must have minted the token at least newScore.Elapsed ago
+	if wallClockElapsed < newScore.Elapsed {
+		log.Printf("Received odd elapsed time: %v (token says %v)\n", newScore.Elapsed, wallClockElapsed)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	// Also, if newScore.Elapsed is much less than wall-clock, it's possible they
+	// were sitting on the page before submit for a long time.
+	// TODO: compare the elapsed time against the best possible time to reject oddness
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
